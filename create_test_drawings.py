@@ -51,7 +51,7 @@ def draw_engineering_sheet(title_label: str, title_val: str, dwg_label: str, dwg
 
     # Row 2: Title Label and Value
     cv2.putText(img, f"{title_label} :", (tb_x + 20, tb_y + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
-    cv2.putText(img, title_val, (tb_x + 20, tb_y + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 2)
+    cv2.putText(img, title_val, (tb_x + 20, tb_y + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
 
     # Row 3: Drawing Number
     cv2.putText(img, f"{dwg_label} : {dwg_no}", (tb_x + 20, tb_y + 175), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2)

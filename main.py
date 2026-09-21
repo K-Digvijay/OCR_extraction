@@ -19,19 +19,34 @@ from PIL import Image
 # Supported drawing extensions
 SUPPORTED_EXTENSIONS = {".pdf", ".tiff", ".tif", ".png", ".jpg", ".jpeg", ".jpe", ".bmp", ".webp"}
 
-# Multilingual Title Keywords (French, Portuguese, English)
-TITLE_KEYWORDS = [
+# Multilingual Title Anchor Keywords (French, Portuguese, English)
+TITLE_ANCHORS = [
     # French
-    "TITRE", "DESIGNATION", "INTITULE", "OBJET", "TITRE DU PLAN",
+    "TITRE", "DESIGNATION", "INTITULE", "OBJET", "SUJET", "LIBELLE",
+    "TITRE DU PLAN", "NOM DU PLAN", "TITRE DU PROJET",
     # Portuguese
     "TITULO", "DESIGNACAO", "DESCRICAO", "DENOMINACAO", "NOME DO PROJETO",
+    "TITULO DO DESENHO", "IDENTIFICACAO",
     # English
     "TITLE", "DRAWING TITLE", "DWG TITLE", "DESCRIPTION", "PROJECT"
 ]
 
+ANCHOR_PREFIX_REGEX = (
+    r"^(?:.*?)(?:TITRE|DESIGNATION|D[EÉ]SIGNATION|INTITUL[EÉ]|OBJET|SUJET|LIBELL[EÉ]|"
+    r"T[IÍ]TULO|DESIGNA[CÇ][AÃ]O|DESCRI[CÇ][AÃ]O|DENOMINA[CÇ][AÃ]O|TITLE|DESCRIPTION|PROJECT)"
+    r"(?:\s*(?:DO\s*DESENHO|DU\s*PLAN|DU\s*PROJET))?"
+    r"(?:\s*/\s*(?:TITRE|DESIGNATION|D[EÉ]SIGNATION|T[IÍ]TULO|TITLE)(?:\s*(?:DO\s*DESENHO|DU\s*PLAN))?)*"
+    r"\s*[:\-\—\.]*\s*"
+)
+
+NON_TITLE_FIELDS_REGEX = (
+    r"^(?:DWG\s*NO|N[°º]?\s*D[EO]\s*(?:PLAN|DESENHO)|REF\s*/|REF\b|REV(?:ISAO)?\b|"
+    r"INDICE\b|DATE\b|DATA\b|ECHELLE\b|ESCALA\b|SCALE\b|FORMAT\b|PAGE\b|SHEET\b|FOLHA\b)"
+)
+
 
 def normalize_for_match(s: str) -> str:
-    """Normalize string ONLY for keyword matching. Never alters the extracted title text."""
+    """Normalize string ONLY for anchor keyword matching. Never alters the extracted title text."""
     if not s:
         return ""
     nfkd = unicodedata.normalize('NFKD', s)
@@ -42,8 +57,8 @@ def normalize_for_match(s: str) -> str:
 
 def load_image(file_path: Path, dpi: int = 300) -> np.ndarray:
     """
-    Fast loader for PDF, TIFF, PNG, JPEG.
-    Uses PyMuPDF for PDFs (fast 300 DPI rendering) and Pillow/OpenCV for images.
+    Load any supported drawing format: PDF, TIFF, TIF, PNG, JPEG, BMP.
+    Uses PyMuPDF for PDFs and Pillow/OpenCV for image files.
     """
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
@@ -74,65 +89,185 @@ def load_image(file_path: Path, dpi: int = 300) -> np.ndarray:
         return img
 
 
-def get_title_block_roi(image: np.ndarray) -> tuple[tuple[int, int, int, int], np.ndarray]:
+def get_title_block_and_cells(image: np.ndarray) -> tuple[tuple[int, int, int, int], list[tuple[int, int, int, int]], np.ndarray]:
     """
-    Locates the Title Block at the bottom-right corner of the drawing sheet (ISO / ASME standard).
-    Fast and robust: finds the bounding lines in the lower-right area.
+    Locates the Title Block and detects internal table cells in the bottom-right corner.
+    Returns:
+        tb_coords: (rx, ry, rw, rh) of the title block
+        cells: list of (cx, cy, cw, ch) for all detected cells in global coordinates
+        crop: the cropped title block image
     """
     h, w = image.shape[:2]
 
-    # Search in bottom-right corner: lower 28% height, right 38% width
-    tb_h = int(h * 0.28)
-    tb_w = int(w * 0.38)
-    x1 = w - tb_w - int(w * 0.015)
-    y1 = h - tb_h - int(h * 0.015)
+    # Search window: bottom-right corner (lower 32% height, right 42% width)
+    roi_y1 = int(h * 0.68)
+    roi_x1 = int(w * 0.58)
+    roi = image[roi_y1:h, roi_x1:w]
+    roi_h, roi_w = roi.shape[:2]
 
-    # Refine boundary using OpenCV lines if prominent box borders exist
-    corner_gray = cv2.cvtColor(image[y1:h, x1:w], cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(corner_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, tb_w // 20), 1))
-    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, tb_h // 15)))
-    lines = cv2.bitwise_or(
+    # Detect horizontal and vertical grid lines
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, roi_w // 25), 1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, roi_h // 20)))
+    grid = cv2.bitwise_or(
         cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h),
         cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v)
     )
 
-    cnts, _ = cv2.findContours(lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_rect = None
-    max_area = 0
-    min_area = (tb_w * tb_h) * 0.15
+    cnts, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    cells = []
+    min_area = (roi_w * roi_h) * 0.003
+    max_area = (roi_w * roi_h) * 0.85
 
     for c in cnts:
         bx, by, bw, bh = cv2.boundingRect(c)
         area = bw * bh
-        if min_area < area < (tb_w * tb_h * 0.98) and area > max_area:
-            max_area = area
-            best_rect = (x1 + bx, y1 + by, bw, bh)
+        touches_border = (bx <= 2 or by <= 2 or (bx + bw) >= roi_w - 2 or (by + bh) >= roi_h - 2)
+        if min_area < area < max_area and not touches_border:
+            cells.append((roi_x1 + bx, roi_y1 + by, bw, bh))
 
-    if best_rect is not None:
-        rx, ry, rw, rh = best_rect
+    if cells:
+        all_x1 = min(c[0] for c in cells)
+        all_y1 = min(c[1] for c in cells)
+        all_x2 = max(c[0] + c[2] for c in cells)
+        all_y2 = max(c[1] + c[3] for c in cells)
+        tb_coords = (all_x1, all_y1, all_x2 - all_x1, all_y2 - all_y1)
     else:
-        rx, ry, rw, rh = x1, y1, tb_w, tb_h
+        fb_w = int(w * 0.32)
+        fb_h = int(h * 0.20)
+        tb_coords = (w - fb_w - int(w * 0.015), h - fb_h - int(h * 0.015), fb_w, fb_h)
+        cells = [tb_coords]
 
+    rx, ry, rw, rh = tb_coords
     crop = image[ry:ry+rh, rx:rx+rw]
-    return (rx, ry, rw, rh), crop
+    return tb_coords, cells, crop
 
 
-def extract_title_and_box(
-    crop_img: np.ndarray,
+def extract_content_from_text(raw_text: str) -> str:
+    """
+    Extracts the drawing title content from raw text by stripping the anchor label prefix.
+    Strictly preserves all punctuation (-, /, \\, &, ., (), :, etc.).
+    """
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    anchor_idx = -1
+    for idx, ln in enumerate(lines):
+        norm = normalize_for_match(ln)
+        for anchor in TITLE_ANCHORS:
+            if re.search(rf"\b{anchor}\b", norm):
+                anchor_idx = idx
+                break
+        if anchor_idx >= 0:
+            break
+
+    if anchor_idx < 0:
+        return ""
+
+    anchor_line = lines[anchor_idx]
+    cleaned_anchor_line = re.sub(ANCHOR_PREFIX_REGEX, "", anchor_line, flags=re.IGNORECASE).strip()
+
+    content_lines = []
+    if cleaned_anchor_line:
+        content_lines.append(cleaned_anchor_line)
+
+    for ln in lines[anchor_idx + 1:]:
+        norm = normalize_for_match(ln)
+        if re.search(NON_TITLE_FIELDS_REGEX, norm, flags=re.IGNORECASE):
+            break
+        content_lines.append(ln)
+
+    content = " ".join(content_lines).strip()
+    content = re.sub(r'[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D—–]', '-', content)
+    content = content.strip("[]| ")
+    return content
+
+
+NON_TITLE_WORDS = {
+    "DWG", "NO", "REF", "REV", "REVISAO", "INDICE", "DATE", "DATA",
+    "SCALE", "ECHELLE", "ESCALA", "SIZE", "PAGE", "SHEET", "FOLHA",
+    "WEIGHT", "POIDS", "PESO", "DRAWN", "APPROVED", "APPR", "REVIEWED",
+    "CHECKED", "DESSINE", "DESENHADO", "MAT", "MATERIAL", "FINISH",
+    "CASE"
+}
+
+TITLE_KEYWORDS = {
+    # English
+    "PLAN", "SCHEME", "SCHEMA", "DIAGRAM", "WORKS", "INTAKE",
+    "DIFFUSER", "SLAB", "REINFORCEMENT", "DETAILS", "SECTION", "ELEVATION",
+    "LAYOUT", "ASSEMBLY", "CIRCUIT", "SYSTEM", "PLATE", "FOUNDATION",
+    "PIPING", "STRUCTURAL", "PROJECT", "BUILDING", "CONSTRUCTION",
+    "INSTALLATION", "GENERAL", "ARRANGEMENT", "SPECIFICATION",
+    # French
+    "TUYAUTERIE", "REFROIDISSEMENT", "POSTE", "ELECTRIQUE", "BATIMENT",
+    "OUVRAGE", "COUPE", "FACADE", "CHAUFFAGE", "DISTRIBUTION",
+    # Portuguese
+    "TUBULACAO", "AGUA", "HIDRAULICO", "ELETRICO", "EDIFICIO", "OBRA",
+    "DETALHES", "CORTE", "FACHADA", "ESTRUTURAL", "LOCALIZACAO", "SISTEMA"
+}
+
+NON_TITLE_PHRASES = [
+    r"UNLESS\s+OTHERWISE\s+SPECIFIED",
+    r"TOLERANCE",
+    r"TOLERANCIAS",
+    r"MINIMUM\s+LENGTHS",
+    r"HORIZONTAL\s+BARS",
+    r"BAR\s+SIZE",
+    r"ALL\s+DIMENSION",
+    r"DO\s+NOT\s+SCALE",
+    r"CONSULTANT",
+    r"ENGINEERING\s+CONSULTANT",
+    r"SUB\s+CONTRACTOR",
+    r"FOR\s+REVIEW",
+    r"APPROVALS",
+    r"APPROVAL",
+    r"DRAWN\s+BY",
+    r"CHECKED\s+BY",
+]
+
+
+def score_cell_for_title(text: str, w: int, h: int) -> float:
+    norm = normalize_for_match(text)
+    if not norm:
+        return -100.0
+    for pat in NON_TITLE_PHRASES:
+        if re.search(pat, norm):
+            return -100.0
+    words = norm.split()
+    if len(words) <= 1:
+        return -50.0
+    if len(words) == 2 and re.search(r"\b(REV|DATE|DATA|SCALE|ECHELLE|DWG)\b", norm):
+        return -50.0
+
+    score = 0.0
+    score += min(len(words), 15) * 5.0
+    score += (w * h) / 1000.0
+    for kw in TITLE_KEYWORDS:
+        if re.search(rf"\b{kw}\b", norm):
+            score += 30.0
+    return score
+
+
+def extract_by_anchor(
+    image: np.ndarray,
     tb_coords: tuple[int, int, int, int],
+    cells: list[tuple[int, int, int, int]],
     lang: str = "auto"
 ) -> tuple[str, tuple[int, int, int, int] | None]:
     """
-    Runs fast local OCR once on the title block crop.
-    Finds the title text and its exact bounding box.
-    If no title is found, returns ("", None) — leaves it empty as requested.
-    Strictly preserves all punctuation (-, /, \, &, ., etc.).
+    Finds the ANCHOR title word (TITRE, DÉSIGNATION, TÍTULO, TITLE, etc.).
+    The bounding box MUST be that anchor title box/cell.
+    Extracts ONLY the title content written under or beside the anchor word.
+    If no anchor title word is found, scans and scores title block cells to
+    extract the primary title content without losing accuracy.
     """
     rx, ry, rw, rh = tb_coords
+    h, w = image.shape[:2]
 
-    # Select best Tesseract language
+    # Select OCR languages
     avail = pytesseract.get_languages()
     chosen_lang = "eng"
     if lang == "fr" and "fra" in avail:
@@ -146,134 +281,165 @@ def extract_title_and_box(
     elif "por" in avail:
         chosen_lang = "por+eng"
 
-    # Fast OCR with bounding boxes in one pass
+    # Step 1: Check detected table cells inside Title Block (excluding the whole block container)
+    proper_cells = [c for c in cells if (c[2] * c[3]) < (rw * rh * 0.70)]
+    for cell in proper_cells:
+        cx, cy, cw, ch = cell
+        cell_crop = image[cy:cy+ch, cx:cx+cw]
+        txt = pytesseract.image_to_string(cell_crop, lang=chosen_lang, config="--psm 6").strip()
+        cnt = extract_content_from_text(txt)
+        if cnt:
+            return cnt, cell
+
+    # Step 2: Fallback to word-level anchor search in the bottom-right ROI
+    roi_y1 = int(h * 0.60)
+    roi_x1 = int(w * 0.45)
+    roi = image[roi_y1:h, roi_x1:w]
+
     data = pytesseract.image_to_data(
-        crop_img,
+        roi,
         lang=chosen_lang,
         config="--psm 3",
         output_type=pytesseract.Output.DICT
     )
 
-    # Group words into lines
-    lines = {}
-    n_boxes = len(data['text'])
-    for i in range(n_boxes):
-        word = data['text'][i].strip()
-        conf = float(data['conf'][i]) if data['conf'][i] != '-1' else 0.0
-        if word:
-            ln = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
-            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-            lines.setdefault(ln, []).append({
-                "text": word,
-                "box": (x, y, w, h),
-                "conf": conf
+    words = []
+    for i in range(len(data['text'])):
+        t = data['text'][i].strip()
+        if t:
+            words.append({
+                "text": t,
+                "x": data['left'][i],
+                "y": data['top'][i],
+                "w": data['width'][i],
+                "h": data['height'][i]
             })
 
-    line_list = []
-    for ln, words in lines.items():
-        full_line = " ".join(w["text"] for w in words).strip()
-        if full_line:
-            min_x = min(w["box"][0] for w in words)
-            min_y = min(w["box"][1] for w in words)
-            max_x = max(w["box"][0] + w["box"][2] for w in words)
-            max_y = max(w["box"][1] + w["box"][3] for w in words)
-            line_list.append({
-                "text": full_line,
-                "box": (min_x, min_y, max_x - min_x, max_y - min_y),
-                "words": words
-            })
-
-    extracted_title = ""
-    title_box = None
-
-    # Step 1: Search for explicit title keywords
-    for idx, item in enumerate(line_list):
-        norm = normalize_for_match(item["text"])
-        for kw in TITLE_KEYWORDS:
-            if kw in norm:
-                # Try to extract inline title value
-                # e.g., "DESIGNATION : PLAN DE MASSE / BAT-A \ 01"
-                pattern = rf"\b{re.escape(kw)}\b\s*[:\-\—]?"
-                match = re.split(pattern, item["text"], flags=re.IGNORECASE)
-                val = match[1].strip() if len(match) > 1 else ""
-
-                if val and len(val) > 2:
-                    extracted_title = val
-                    title_box = (rx + item["box"][0], ry + item["box"][1], item["box"][2], item["box"][3])
-                    break
-                elif idx + 1 < len(line_list):
-                    # Value is on the next line immediately below the keyword
-                    next_item = line_list[idx + 1]
-                    next_text = next_item["text"].strip()
-                    if len(next_text) > 3:
-                        extracted_title = next_text
-                        title_box = (rx + next_item["box"][0], ry + next_item["box"][1], next_item["box"][2], next_item["box"][3])
-                        break
-        if extracted_title:
+    # Locate Anchor Word
+    anchor_word = None
+    for idx, w_info in enumerate(words):
+        norm = normalize_for_match(w_info["text"])
+        for a in TITLE_ANCHORS:
+            if re.search(rf"\b{a}\b", norm):
+                anchor_word = w_info
+                break
+        if anchor_word:
             break
 
-    # Step 2: Fallback - CAD convention: drawing title is the largest text height
-    if not extracted_title and line_list:
-        best_item = None
-        max_h = 0
-        for item in line_list:
-            t = item["text"].strip()
-            # Ignore company names with INC, SAS, LTDA, SA or very short codes
-            norm = normalize_for_match(t)
-            is_company = any(c in norm for c in ["SAS", "LTDA", "INC", "CORP", "COMPANY", "COMPANHIA", "SOCIETE", "BUREAU"])
-            is_dwg_no = any(d in norm for d in ["DWG", "REF", "REV", "ECHELLE", "ESCALA", "DATE", "DATA"])
-            if len(t) > 5 and not is_company and not is_dwg_no:
-                h = item["box"][3]
-                if h > max_h:
-                    max_h = h
-                    best_item = item
+    if anchor_word:
+        ax, ay, aw, ah = anchor_word["x"], anchor_word["y"], anchor_word["w"], anchor_word["h"]
+        title_words = []
 
-        if best_item is not None:
-            extracted_title = best_item["text"].strip()
-            title_box = (rx + best_item["box"][0], ry + best_item["box"][1], best_item["box"][2], best_item["box"][3])
+        # Check same-line words (right of anchor)
+        same_line = []
+        for w_info in words:
+            if w_info is anchor_word:
+                continue
+            if abs(w_info["y"] - ay) < max(ah, 20) and w_info["x"] > (ax + aw * 0.5):
+                if not re.match(r"^[:\-\—\.\/]+$", w_info["text"]):
+                    same_line.append(w_info)
 
-    # If title is not written / not found, leave it as requested ("if the title is not written to take the bounding box leave it")
-    if not extracted_title or len(extracted_title) < 3:
-        return "", None
+        if same_line:
+            first_norm = normalize_for_match(same_line[0]["text"])
+            if first_norm not in NON_TITLE_WORDS:
+                title_words.extend(same_line)
 
-    # Clean typographical dashes to standard hyphen while strictly preserving all punctuation (-, /, \, &, .)
-    extracted_title = re.sub(r'[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D—–]', '-', extracted_title).strip()
+        # Check lines below anchor word
+        below_lines = {}
+        for w_info in words:
+            if (ay + ah * 0.6) <= w_info["y"] <= (ay + ah * 10):
+                if (ax - 80) <= w_info["x"] <= (ax + max(aw * 10, 1000)):
+                    y_bucket = round(w_info["y"] / 15) * 15
+                    below_lines.setdefault(y_bucket, []).append(w_info)
 
-    # Add a comfortable margin around the title bounding box
-    if title_box is not None:
-        bx, by, bw, bh = title_box
-        margin_x = 10
-        margin_y = 6
-        title_box = (
-            max(0, bx - margin_x),
-            max(0, by - margin_y),
-            bw + (margin_x * 2),
-            bh + (margin_y * 2)
-        )
+        for y_b in sorted(below_lines.keys()):
+            line_w = sorted(below_lines[y_b], key=lambda item: item["x"])
+            line_text = " ".join(item["text"] for item in line_w)
+            norm_line = normalize_for_match(line_text)
 
-    return extracted_title, title_box
+            words_norm = norm_line.split()
+            if words_norm and words_norm[0] in NON_TITLE_WORDS:
+                break
+            if re.search(r"\b(REV|DATE|DATA|SCALE|ECHELLE|ESCALA|DWG|SIZE|SHEET|FOLHA|N\s*DE\s*PLAN|N\s*DO\s*DESENHO)\b", norm_line):
+                break
+
+            title_words.extend(line_w)
+            if len(title_words) >= 15:
+                break
+
+        if title_words:
+            all_title_boxes = [anchor_word] + title_words
+            min_x = min(w["x"] for w in all_title_boxes)
+            min_y = min(w["y"] for w in all_title_boxes)
+            max_x = max(w["x"] + w["w"] for w in all_title_boxes)
+            max_y = max(w["y"] + w["h"] for w in all_title_boxes)
+
+            title_box = (
+                max(0, roi_x1 + min_x - 12),
+                max(0, roi_y1 + min_y - 10),
+                min(w - (roi_x1 + min_x - 12), (max_x - min_x) + 24),
+                min(h - (roi_y1 + min_y - 10), (max_y - min_y) + 20)
+            )
+
+            title_text = " ".join(w["text"] for w in title_words).strip()
+            title_text = re.sub(r'[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D—–]', '-', title_text)
+            title_text = title_text.strip("[]|: ")
+            return title_text, title_box
+
+    # Step 3: If no anchor word was found, scan and score cells to extract title content
+    best_score = 50.0
+    best_cell = None
+    best_cell_text = ""
+    for cell in proper_cells:
+        cx, cy, cw, ch = cell
+        cell_crop = image[cy:cy+ch, cx:cx+cw]
+        txt = pytesseract.image_to_string(cell_crop, lang=chosen_lang, config="--psm 6").strip()
+        sc = score_cell_for_title(txt, cw, ch)
+        if sc > best_score:
+            best_score = sc
+            best_cell = cell
+            best_cell_text = txt
+
+    if best_cell:
+        lines = [ln.strip() for ln in best_cell_text.splitlines() if ln.strip()]
+        clean_lines = []
+        for ln in lines:
+            norm = normalize_for_match(ln)
+            if not re.search(NON_TITLE_FIELDS_REGEX, norm, flags=re.IGNORECASE):
+                clean_lines.append(ln)
+        content = " ".join(clean_lines).strip()
+        content = re.sub(r'[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D—–]', '-', content)
+        content = content.strip("[]|: ")
+        if content:
+            return content, best_cell
+
+    return "", None
 
 
 def save_outputs(
     image: np.ndarray,
     tb_coords: tuple[int, int, int, int],
     title_box: tuple[int, int, int, int] | None,
-    title_text: str,
+    title_content: str,
     output_dir: Path,
     file_stem: str
 ):
     """
     Saves the 3 required outputs:
-    1. <name>_crop.png: Cropped image of the title block.
-    2. <name>_boxes.png: OpenCV visualizer showing the title box (or left clean if no title).
-    3. <name>_extracted.txt: ONLY the extracted title written (or empty if not found).
+    1. <name>_crop.png: Cropped image of the detected Title Box (or Title Block if no box).
+    2. <name>_boxes.png: OpenCV visualizer showing the title anchor box (or left clean if no title).
+    3. <name>_extracted.txt: ONLY the extracted title content (or empty 0 bytes if not found).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     rx, ry, rw, rh = tb_coords
 
-    # Output 1: Crop of Title Block
+    # Output 1: Crop of Title Box (from where the title is extracted)
     crop_path = output_dir / f"{file_stem}_crop.png"
-    crop_img = image[ry:ry+rh, rx:rx+rw]
+    if title_box is not None:
+        tx, ty, tw, th = title_box
+        crop_img = image[ty:ty+th, tx:tx+tw]
+    else:
+        crop_img = image[ry:ry+rh, rx:rx+rw]
     cv2.imwrite(str(crop_path), crop_img)
 
     # Output 2: OpenCV Boxes Visualizer
@@ -285,13 +451,13 @@ def save_outputs(
     cv2.rectangle(vis, (rx, max(0, ry - 30)), (rx + 200, ry), (0, 200, 0), -1)
     cv2.putText(vis, "TITLE BLOCK", (rx + 5, max(18, ry - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    # If title was found, draw the prominent red title box
+    # If anchor title was found, draw THAT box in prominent bold red
     if title_box is not None:
         tx, ty, tw, th = title_box
         cv2.rectangle(vis, (tx, ty), (tx + tw, ty + th), (0, 0, 255), 4)
         tag_y = max(24, ty - 6)
-        cv2.rectangle(vis, (tx, tag_y - 24), (tx + 220, tag_y + 2), (0, 0, 220), -1)
-        cv2.putText(vis, "EXTRACTED TITLE", (tx + 5, tag_y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        cv2.rectangle(vis, (tx, tag_y - 24), (tx + 200, tag_y + 2), (0, 0, 220), -1)
+        cv2.putText(vis, "TITLE BOX", (tx + 5, tag_y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
     # Zoomed ROI output with 15% margin
     margin = int(max(rw, rh) * 0.15)
@@ -302,11 +468,11 @@ def save_outputs(
     zoomed = vis[vy1:vy2, vx1:vx2]
     cv2.imwrite(str(boxes_path), zoomed)
 
-    # Output 3: Only the title written in the txt file (empty if not found)
+    # Output 3: Only the title content written in the txt file (empty if not found)
     txt_path = output_dir / f"{file_stem}_extracted.txt"
     with open(txt_path, "w", encoding="utf-8") as f:
-        if title_text:
-            f.write(title_text.strip() + "\n")
+        if title_content:
+            f.write(title_content.strip() + "\n")
 
 
 def process_file(file_path: Path, output_dir: Path, overwrite: bool = False, lang: str = "auto", dpi: int = 300) -> bool:
@@ -323,23 +489,24 @@ def process_file(file_path: Path, output_dir: Path, overwrite: bool = False, lan
         # 1. Load image (PDF, TIFF, PNG, JPEG)
         img = load_image(file_path, dpi=dpi)
 
-        # 2. Get Title Block ROI (bottom-right)
-        tb_coords, crop_img = get_title_block_roi(img)
+        # 2. Get Title Block and Table Cells (bottom-right)
+        tb_coords, cells, crop_img = get_title_block_and_cells(img)
 
-        # 3. Extract Title and its exact bounding box
-        title, title_box = extract_title_and_box(crop_img, tb_coords, lang=lang)
+        # 3. Locate Title Anchor word, take that box, and extract the content
+        title_content, title_box = extract_by_anchor(img, tb_coords, cells, lang=lang)
 
-        if title:
-            print(f"  -> Title Extracted: '{title}'")
+        if title_content:
+            print(f"  -> Title Content Extracted: '{title_content}'")
+            print(f"  -> Title Anchor Box: x={title_box[0]}, y={title_box[1]}, w={title_box[2]}, h={title_box[3]}")
         else:
-            print(f"  -> [No Title Found] Leaving title and bounding box empty.")
+            print(f"  -> [No Title Anchor Found] Leaving title box and text empty.")
 
         # 4. Save the 3 outputs
         save_outputs(
             image=img,
             tb_coords=tb_coords,
             title_box=title_box,
-            title_text=title,
+            title_content=title_content,
             output_dir=output_dir,
             file_stem=file_stem
         )
@@ -353,7 +520,7 @@ def process_file(file_path: Path, output_dir: Path, overwrite: bool = False, lan
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fast Local Scanned PDF/TIFF/PNG/JPEG Drawing Title Extractor")
+    parser = argparse.ArgumentParser(description="Fast Local Scanned PDF/TIFF/PNG/JPEG Title Anchor Extractor")
     parser.add_argument("--input", "-i", required=True, help="Path to input drawing file or directory")
     parser.add_argument("--output", "-o", required=True, help="Output directory")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")

@@ -64,9 +64,9 @@ def make_vintage_drawing(title_label: str, title_val: str, dwg_no: str, company:
     draw = ImageDraw.Draw(pil_img)
 
     # Load fonts
-    font_large = get_font(38)
-    font_medium = get_font(32)
-    font_small = get_font(26)
+    font_large = get_font(30)
+    font_medium = get_font(26)
+    font_small = get_font(22)
 
     # 1. Outer drawing border
     draw.rectangle([(60, 60), (width - 60, height - 60)], outline=(0, 0, 0), width=4)
