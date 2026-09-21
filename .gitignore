@@ -1,0 +1,7 @@
+.venv/
+test_results/
+test_samples/
+*.pyc
+__pycache__/
+*.pdf
+sample/
