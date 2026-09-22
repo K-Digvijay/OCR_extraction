@@ -5,3 +5,4 @@ test_samples/
 __pycache__/
 *.pdf
 sample/
+test_pipeline_results/

@@ -55,11 +55,12 @@ def normalize_for_match(s: str) -> str:
     return " ".join(clean.upper().split())
 
 
-def load_image(file_path: Path, dpi: int = 300) -> np.ndarray:
+def load_image(file_path: Path | str, dpi: int = 350) -> np.ndarray:
     """
     Load any supported drawing format: PDF, TIFF, TIF, PNG, JPEG, BMP.
-    Uses PyMuPDF for PDFs and Pillow/OpenCV for image files.
+    Uses PyMuPDF for PDFs (at high 350 DPI) and Pillow/OpenCV for image files.
     """
+    file_path = Path(file_path)
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
         doc = pymupdf.open(str(file_path))
@@ -89,31 +90,65 @@ def load_image(file_path: Path, dpi: int = 300) -> np.ndarray:
         return img
 
 
+def enhance_hardly_visible_scan(roi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Flattens uneven lighting/paper yellowing, boosts faint pencil/faded ink contrast,
+    and produces an optimal adaptive thresholded binarization for degraded scans.
+    """
+    if len(roi.shape) == 3:
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = roi.copy()
+
+    # 1. Background illumination estimation & division (removes shadows, yellowing, gradients)
+    kernel_size = max(15, min(gray.shape) // 10)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    flat = cv2.divide(gray, bg, scale=255)
+
+    # 2. Contrast Limited Adaptive Histogram Equalization (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(flat)
+
+    # 3. Bilateral filter to smooth background noise while preserving character edges
+    smooth = cv2.bilateralFilter(enhanced_gray, d=7, sigmaColor=75, sigmaSpace=75)
+
+    # 4. Adaptive Gaussian Thresholding
+    thresh = cv2.adaptiveThreshold(
+        smooth, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 12
+    )
+    clean_thresh = cv2.medianBlur(thresh, 3)
+    return enhanced_gray, clean_thresh
+
+
 def get_title_block_and_cells(image: np.ndarray) -> tuple[tuple[int, int, int, int], list[tuple[int, int, int, int]], np.ndarray]:
     """
-    Locates the Title Block and detects internal table cells in the bottom-right corner.
+    Locates the Title Block and detects internal table cells strictly in the bottom-right corner.
     Returns:
         tb_coords: (rx, ry, rw, rh) of the title block
-        cells: list of (cx, cy, cw, ch) for all detected cells in global coordinates
+        cells: list of (cx, cy, cw, ch) for detected cells in global coordinates
         crop: the cropped title block image
     """
     h, w = image.shape[:2]
 
-    # Search window: bottom-right corner (lower 32% height, right 42% width)
+    # Search window: strictly bottom-right corner (lower 32% height, right 42% width)
     roi_y1 = int(h * 0.68)
     roi_x1 = int(w * 0.58)
     roi = image[roi_y1:h, roi_x1:w]
     roi_h, roi_w = roi.shape[:2]
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Enhance corner for grid detection even on faint scans
+    enhanced_gray, _ = enhance_hardly_visible_scan(roi)
+    _, inv = cv2.threshold(enhanced_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     # Detect horizontal and vertical grid lines
     kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, roi_w // 25), 1))
     kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, roi_h // 20)))
     grid = cv2.bitwise_or(
-        cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h),
-        cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v)
+        cv2.morphologyEx(inv, cv2.MORPH_OPEN, kernel_h),
+        cv2.morphologyEx(inv, cv2.MORPH_OPEN, kernel_v)
     )
 
     cnts, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -126,14 +161,25 @@ def get_title_block_and_cells(image: np.ndarray) -> tuple[tuple[int, int, int, i
         area = bw * bh
         touches_border = (bx <= 2 or by <= 2 or (bx + bw) >= roi_w - 2 or (by + bh) >= roi_h - 2)
         if min_area < area < max_area and not touches_border:
-            cells.append((roi_x1 + bx, roi_y1 + by, bw, bh))
+            global_cx = roi_x1 + bx
+            global_cy = roi_y1 + by
+            # Discard any candidate cell located in the upper-left of the ROI (likely rebar or notes)
+            if global_cy >= int(h * 0.70) and global_cx >= int(w * 0.58):
+                cells.append((global_cx, global_cy, bw, bh))
 
     if cells:
+        # Cluster cells belonging strictly to the bottom-right title block
         all_x1 = min(c[0] for c in cells)
         all_y1 = min(c[1] for c in cells)
         all_x2 = max(c[0] + c[2] for c in cells)
         all_y2 = max(c[1] + c[3] for c in cells)
-        tb_coords = (all_x1, all_y1, all_x2 - all_x1, all_y2 - all_y1)
+
+        # Enforce maximum title block bounds per ISO 7200 (max 42% width, 25% height)
+        max_tb_w = int(w * 0.42)
+        max_tb_h = int(h * 0.25)
+        tb_w = min(all_x2 - all_x1, max_tb_w)
+        tb_h = min(all_y2 - all_y1, max_tb_h)
+        tb_coords = (all_x2 - tb_w, all_y2 - tb_h, tb_w, tb_h)
     else:
         fb_w = int(w * 0.32)
         fb_h = int(h * 0.20)
@@ -229,25 +275,42 @@ NON_TITLE_PHRASES = [
 ]
 
 
-def score_cell_for_title(text: str, w: int, h: int) -> float:
+def score_cell_for_title(text: str, w_cell: int, h_cell: int, cx: int, cy: int, img_w: int, img_h: int) -> float:
     norm = normalize_for_match(text)
     if not norm:
-        return -100.0
+        return -200.0
     for pat in NON_TITLE_PHRASES:
         if re.search(pat, norm):
-            return -100.0
+            return -200.0
     words = norm.split()
     if len(words) <= 1:
-        return -50.0
-    if len(words) == 2 and re.search(r"\b(REV|DATE|DATA|SCALE|ECHELLE|DWG)\b", norm):
-        return -50.0
+        return -100.0
+    if len(words) == 2 and re.search(r"\b(REV|DATE|DATA|SCALE|ECHELLE|DWG|CASE|SHEET|FOLHA)\b", norm):
+        return -100.0
 
     score = 0.0
+    # Length and area weighting
     score += min(len(words), 15) * 5.0
-    score += (w * h) / 1000.0
+    score += (w_cell * h_cell) / 1000.0
+
+    # Title keyword weighting
     for kw in TITLE_KEYWORDS:
         if re.search(rf"\b{kw}\b", norm):
-            score += 30.0
+            score += 35.0
+
+    # Strict Bottom-Right Corner Proximity Score:
+    # Distance from cell bottom-right corner (cx + w_cell, cy + h_cell) to sheet bottom-right corner (img_w, img_h)
+    dist_to_corner = np.sqrt((img_w - (cx + w_cell))**2 + (img_h - (cy + h_cell))**2)
+    max_corner_dist = np.sqrt(img_w**2 + img_h**2) * 0.40
+    proximity_score = max(0.0, (1.0 - dist_to_corner / max_corner_dist) * 100.0)
+    score += proximity_score
+
+    # Heavy penalty for anything located outside the bottom-right zone
+    if cy < (img_h * 0.65):
+        score -= 75.0
+    if cx < (img_w * 0.50):
+        score -= 75.0
+
     return score
 
 
@@ -261,8 +324,9 @@ def extract_by_anchor(
     Finds the ANCHOR title word (TITRE, DÉSIGNATION, TÍTULO, TITLE, etc.).
     The bounding box MUST be that anchor title box/cell.
     Extracts ONLY the title content written under or beside the anchor word.
-    If no anchor title word is found, scans and scores title block cells to
-    extract the primary title content without losing accuracy.
+    If no anchor title word is found, scans and scores title block cells strictly
+    in the bottom-right corner to extract the primary title content without losing accuracy.
+    Uses multi-stage scan enhancement to recover faint, faded, or hardly visible text.
     """
     rx, ry, rw, rh = tb_coords
     h, w = image.shape[:2]
@@ -283,25 +347,44 @@ def extract_by_anchor(
 
     # Step 1: Check detected table cells inside Title Block (excluding the whole block container)
     proper_cells = [c for c in cells if (c[2] * c[3]) < (rw * rh * 0.70)]
+    # Sort cells strictly by proximity to the bottom-right corner (closest first)
+    proper_cells.sort(key=lambda c: np.sqrt((w - (c[0] + c[2]))**2 + (h - (c[1] + c[3]))**2))
+
     for cell in proper_cells:
         cx, cy, cw, ch = cell
         cell_crop = image[cy:cy+ch, cx:cx+cw]
-        txt = pytesseract.image_to_string(cell_crop, lang=chosen_lang, config="--psm 6").strip()
+        enh_gray, enh_thresh = enhance_hardly_visible_scan(cell_crop)
+
+        # Pass 1: Enhanced Grayscale
+        txt = pytesseract.image_to_string(enh_gray, lang=chosen_lang, config="--psm 6").strip()
         cnt = extract_content_from_text(txt)
+        if not cnt:
+            # Pass 2: Clean Adaptive Threshold (for very faint/faded pencil/ink)
+            txt2 = pytesseract.image_to_string(enh_thresh, lang=chosen_lang, config="--psm 6").strip()
+            cnt = extract_content_from_text(txt2)
         if cnt:
             return cnt, cell
 
     # Step 2: Fallback to word-level anchor search in the bottom-right ROI
-    roi_y1 = int(h * 0.60)
-    roi_x1 = int(w * 0.45)
+    roi_y1 = max(0, int(h * 0.65))
+    roi_x1 = max(0, int(w * 0.55))
     roi = image[roi_y1:h, roi_x1:w]
+    enh_roi_gray, enh_roi_thresh = enhance_hardly_visible_scan(roi)
 
     data = pytesseract.image_to_data(
-        roi,
+        enh_roi_gray,
         lang=chosen_lang,
         config="--psm 3",
         output_type=pytesseract.Output.DICT
     )
+    if len([t for t in data['text'] if t.strip()]) < 4:
+        # Fallback to thresholded ROI if grayscale has faint strokes
+        data = pytesseract.image_to_data(
+            enh_roi_thresh,
+            lang=chosen_lang,
+            config="--psm 3",
+            output_type=pytesseract.Output.DICT
+        )
 
     words = []
     for i in range(len(data['text'])):
@@ -369,10 +452,10 @@ def extract_by_anchor(
 
         if title_words:
             all_title_boxes = [anchor_word] + title_words
-            min_x = min(w["x"] for w in all_title_boxes)
-            min_y = min(w["y"] for w in all_title_boxes)
-            max_x = max(w["x"] + w["w"] for w in all_title_boxes)
-            max_y = max(w["y"] + w["h"] for w in all_title_boxes)
+            min_x = min(w_box["x"] for w_box in all_title_boxes)
+            min_y = min(w_box["y"] for w_box in all_title_boxes)
+            max_x = max(w_box["x"] + w_box["w"] for w_box in all_title_boxes)
+            max_y = max(w_box["y"] + w_box["h"] for w_box in all_title_boxes)
 
             title_box = (
                 max(0, roi_x1 + min_x - 12),
@@ -381,20 +464,23 @@ def extract_by_anchor(
                 min(h - (roi_y1 + min_y - 10), (max_y - min_y) + 20)
             )
 
-            title_text = " ".join(w["text"] for w in title_words).strip()
+            title_text = " ".join(w_box["text"] for w_box in title_words).strip()
             title_text = re.sub(r'[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D—–]', '-', title_text)
             title_text = title_text.strip("[]|: ")
             return title_text, title_box
 
-    # Step 3: If no anchor word was found, scan and score cells to extract title content
+    # Step 3: If no anchor word was found, scan and score cells strictly in the bottom-right corner
     best_score = 50.0
     best_cell = None
     best_cell_text = ""
     for cell in proper_cells:
         cx, cy, cw, ch = cell
         cell_crop = image[cy:cy+ch, cx:cx+cw]
-        txt = pytesseract.image_to_string(cell_crop, lang=chosen_lang, config="--psm 6").strip()
-        sc = score_cell_for_title(txt, cw, ch)
+        enh_gray, enh_thresh = enhance_hardly_visible_scan(cell_crop)
+        txt = pytesseract.image_to_string(enh_gray, lang=chosen_lang, config="--psm 6").strip()
+        if not txt:
+            txt = pytesseract.image_to_string(enh_thresh, lang=chosen_lang, config="--psm 6").strip()
+        sc = score_cell_for_title(txt, cw, ch, cx, cy, w, h)
         if sc > best_score:
             best_score = sc
             best_cell = cell
